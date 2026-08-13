@@ -2,7 +2,7 @@
 
 一个简化版的Cloudflare Workers优选工具，用来生成订阅链接。
 
-GitHub: https://github.com/byJoey/yx-auto
+GitHub: https://github.com/tanying-spec/yx-auto
 
 ## 主要功能
 
