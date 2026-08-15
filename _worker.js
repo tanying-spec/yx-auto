@@ -5,12 +5,7 @@
 // 默认配置
 let customPreferredIPs = [];
 let customPreferredDomains = [];
-let epd = true;  // 启用优选域名
-let epi = true;  // 启用优选IP
-let egi = true;  // 启用GitHub优选
-let ev = true;   // 启用VLESS协议
-let et = false;  // 启用Trojan协议
-let vm = false;  // 启用VMess协议
+const DEFAULT_EV = true;   // 默认启用 VLESS；其余请求开关均在 fetch 内局部计算
 let scu = 'https://url.v1.mk/sub';  // 订阅转换地址
 // ECH (Encrypted Client Hello)
 let enableECH = false;
@@ -42,6 +37,9 @@ const WETEST_CACHE_TTL = 900;
 const IPV4_RESERVE_RATIO = 0.10;
 const WETEST_HISTORY_KEY = 'wetest-ip-history-v1';
 const MAX_WETEST_HISTORY_IPS = 500;
+const NORMAL_IP_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+const PROTECTED_IP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const WETEST_STATUS_KEY = 'wetest-status-v1';
 
 // UUID验证
 function isValidUUID(str) {
@@ -58,41 +56,91 @@ function getConfigValue(key, defaultValue) {
 async function fetchDynamicIPs(env, ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true, resultLimit = MAX_DYNAMIC_IPS) {
     const v4Url = "https://www.wetest.vip/page/cloudflare/address_v4.html";
     const v6Url = "https://www.wetest.vip/page/cloudflare/address_v6.html";
-    let results = [];
 
     try {
-        // 两个版本始终采集，避免用户本次关闭 IPv4/IPv6 时漏掉历史数据。
-        const [ipv4List, ipv6List] = await Promise.all([
-            fetchAndParseWetest(v4Url),
-            fetchAndParseWetest(v6Url)
-        ]);
-        const history = await mergeWetestHistory(env, [...ipv4List, ...ipv6List]);
+        // 订阅请求只读取 Cron 维护的快照，避免并发请求互相覆盖 KV。
+        // 没有 KV 或尚无快照时才实时抓取，并且不在请求路径写入。
+        let history = await readWetestHistory(env);
+        if (history.length === 0) {
+            const [ipv4List, ipv6List] = await Promise.all([
+                fetchAndParseWetest(v4Url),
+                fetchAndParseWetest(v6Url)
+            ]);
+            history = markCurrentWetestItems([...ipv4List, ...ipv6List]);
+        }
         const wetestResults = filterDynamicIPs(
             history,
             ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom
         );
         const preferredColo = getPreferredColo(ispMobile, ispUnicom, ispTelecom);
-        return selectWetestIPs(dedupeIPItems(wetestResults), Math.max(0, resultLimit), preferredColo, ipv4Enabled, ipv6Enabled);
+        return selectWetestIPs(
+            dedupeIPItems(wetestResults), Math.max(0, resultLimit), preferredColo,
+            ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom
+        );
     } catch (e) {
+        console.error('读取 WeTest 优选 IP 失败:', e);
         return [];
     }
+}
+
+async function readWetestHistory(env) {
+    const kv = env && env.WETEST_HISTORY;
+    if (!kv) return [];
+    try {
+        const value = await kv.get(WETEST_HISTORY_KEY, 'json');
+        return Array.isArray(value) ? value : [];
+    } catch (error) {
+        console.error('读取 WeTest KV 历史失败:', error);
+        return [];
+    }
+}
+
+function markCurrentWetestItems(items, now = new Date().toISOString()) {
+    return dedupeIPItems(items).map(item => ({
+        ...item,
+        firstSeen: item.firstSeen || now,
+        lastSeen: now,
+        seenCount: Math.max(1, Number(item.seenCount) || 0),
+        consecutiveSeen: Math.max(1, Number(item.consecutiveSeen) || 0),
+        missingCycles: 0
+    }));
+}
+
+async function refreshWetestHistory(env) {
+    const [ipv4List, ipv6List] = await Promise.all([
+        fetchAndParseWetest("https://www.wetest.vip/page/cloudflare/address_v4.html"),
+        fetchAndParseWetest("https://www.wetest.vip/page/cloudflare/address_v6.html")
+    ]);
+    if (ipv4List.length === 0 || ipv6List.length === 0) {
+        throw new Error(`WeTest 本轮数据不完整（IPv4=${ipv4List.length}, IPv6=${ipv6List.length}）`);
+    }
+    const current = [...ipv4List, ...ipv6List];
+    return mergeWetestHistory(env, current);
 }
 
 async function mergeWetestHistory(env, currentItems) {
     const kv = env && env.WETEST_HISTORY;
     // 未绑定 KV 时仍可运行，只是不具备跨请求的历史积累能力。
-    if (!kv) return dedupeIPItems(currentItems);
+    if (!kv) return markCurrentWetestItems(currentItems);
     let history = [];
     try {
         history = await kv.get(WETEST_HISTORY_KEY, 'json') || [];
     } catch (_) {
         history = [];
     }
-    const now = new Date().toISOString();
+    const nowDate = new Date();
+    const now = nowDate.toISOString();
     const merged = new Map();
+    const currentKeys = new Set(currentItems.filter(item => item?.ip).map(item => `${item.ip}|${item.port || 443}`));
     for (const item of history) {
         if (!item || !item.ip) continue;
-        merged.set(`${item.ip}|${item.port || 443}`, item);
+        const key = `${item.ip}|${item.port || 443}`;
+        merged.set(key, {
+            ...item,
+            seenCount: Number(item.seenCount) || 1,
+            consecutiveSeen: currentKeys.has(key) ? Number(item.consecutiveSeen) || 1 : 0,
+            missingCycles: currentKeys.has(key) ? 0 : (Number(item.missingCycles) || 0) + 1
+        });
     }
     for (const item of currentItems) {
         const key = `${item.ip}|${item.port || 443}`;
@@ -101,18 +149,72 @@ async function mergeWetestHistory(env, currentItems) {
             ...old,
             ...item,
             firstSeen: old?.firstSeen || now,
-            lastSeen: now
+            lastSeen: now,
+            seenCount: (Number(old?.seenCount) || 0) + 1,
+            consecutiveSeen: (Number(old?.consecutiveSeen) || 0) + 1,
+            missingCycles: 0
         });
     }
     // 历史池超过上限时，优先保留 HKG/NRT 的 IPv6；其余记录按
     // lastSeen 从新到旧保留。保护组自身超过上限时也会淘汰最老记录。
-    const result = pruneWetestHistory(Array.from(merged.values()), MAX_WETEST_HISTORY_IPS);
+    const result = pruneWetestHistory(Array.from(merged.values()), MAX_WETEST_HISTORY_IPS, nowDate.getTime());
     try {
         await kv.put(WETEST_HISTORY_KEY, JSON.stringify(result));
+        await kv.put(WETEST_STATUS_KEY, JSON.stringify({
+            status: 'ok',
+            updatedAt: now,
+            lastSuccessAt: now,
+            currentIPv4: currentItems.filter(item => item?.ip && !item.ip.includes(':')).length,
+            currentIPv6: currentItems.filter(item => item?.ip?.includes(':')).length,
+            historyTotal: result.length,
+            historyIPv4: result.filter(item => !item.ip.includes(':')).length,
+            historyIPv6: result.filter(item => item.ip.includes(':')).length,
+            error: ''
+        }));
     } catch (_) {
         // KV 写入失败不影响本次订阅生成。
     }
     return result;
+}
+
+async function recordWetestError(env, error) {
+    const kv = env && env.WETEST_HISTORY;
+    if (!kv) return;
+    try {
+        const previous = await kv.get(WETEST_STATUS_KEY, 'json') || {};
+        await kv.put(WETEST_STATUS_KEY, JSON.stringify({
+            ...previous,
+            status: 'error',
+            checkedAt: new Date().toISOString(),
+            error: String(error?.message || error || 'unknown error').slice(0, 300)
+        }));
+    } catch (_) { }
+}
+
+async function handleStatusRequest(env) {
+    const kv = env && env.WETEST_HISTORY;
+    const [status, history] = kv ? await Promise.all([
+        kv.get(WETEST_STATUS_KEY, 'json').catch(() => null),
+        kv.get(WETEST_HISTORY_KEY, 'json').catch(() => [])
+    ]) : [null, []];
+    const items = Array.isArray(history) ? history : [];
+    const payload = {
+        configured: { kv: Boolean(kv), cronExpected: '*/15 * * * *' },
+        collection: status || { status: kv ? 'waiting' : 'kv_unbound' },
+        history: {
+            total: items.length,
+            ipv4: items.filter(item => item?.ip && !item.ip.includes(':')).length,
+            ipv6: items.filter(item => item?.ip?.includes(':')).length,
+            protectedHkgNrtIPv6: items.filter(isProtectedWetestIP).length
+        },
+        limits: {
+            subscriptionNodes: MAX_SUBSCRIPTION_NODES,
+            historyIPs: MAX_WETEST_HISTORY_IPS
+        }
+    };
+    return new Response(JSON.stringify(payload, null, 2), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+    });
 }
 
 function isProtectedWetestIP(item) {
@@ -121,11 +223,18 @@ function isProtectedWetestIP(item) {
     return colo.includes('HKG') || colo.includes('NRT');
 }
 
-function pruneWetestHistory(items, limit) {
-    return items.map((item, index) => ({ item, index })).sort((a, b) => {
+function pruneWetestHistory(items, limit, now = Date.now()) {
+    return items.filter(item => {
+        const lastSeen = Date.parse(item.lastSeen || 0);
+        if (!Number.isFinite(lastSeen)) return false;
+        const maxAge = isProtectedWetestIP(item) ? PROTECTED_IP_MAX_AGE_MS : NORMAL_IP_MAX_AGE_MS;
+        return now - lastSeen <= maxAge;
+    }).map((item, index) => ({ item, index })).sort((a, b) => {
+        const currentDiff = Number((a.item.missingCycles || 0) === 0) - Number((b.item.missingCycles || 0) === 0);
         const protectedDiff = Number(isProtectedWetestIP(b.item)) - Number(isProtectedWetestIP(a.item));
+        const stableDiff = (Number(b.item.consecutiveSeen) || 0) - (Number(a.item.consecutiveSeen) || 0);
         const recentDiff = Date.parse(b.item.lastSeen || 0) - Date.parse(a.item.lastSeen || 0);
-        return protectedDiff || recentDiff || a.index - b.index;
+        return -currentDiff || protectedDiff || stableDiff || recentDiff || a.index - b.index;
     }).slice(0, limit).map(entry => entry.item);
 }
 
@@ -139,38 +248,60 @@ function getPreferredColo(ispMobile, ispUnicom, ispTelecom) {
 
 function sortByPreferredColo(items, preferredColo) {
     return items.map((item, index) => ({ item, index })).sort((a, b) => {
+        const currentDiff = Number((b.item.missingCycles || 0) === 0) - Number((a.item.missingCycles || 0) === 0);
         const aPreferred = preferredColo && (a.item.colo || '').toUpperCase().includes(preferredColo) ? 0 : 1;
         const bPreferred = preferredColo && (b.item.colo || '').toUpperCase().includes(preferredColo) ? 0 : 1;
+        const stableDiff = (Number(b.item.consecutiveSeen) || 0) - (Number(a.item.consecutiveSeen) || 0);
         const recentDiff = Date.parse(b.item.lastSeen || 0) - Date.parse(a.item.lastSeen || 0);
-        return aPreferred - bPreferred || recentDiff || a.index - b.index;
+        return currentDiff || aPreferred - bPreferred || stableDiff || recentDiff || a.index - b.index;
     }).map(entry => entry.item);
 }
 
-function selectWetestIPs(items, limit, preferredColo, ipv4Enabled, ipv6Enabled) {
+function selectWetestIPs(items, limit, preferredColo, ipv4Enabled, ipv6Enabled, ispMobile = true, ispUnicom = true, ispTelecom = true) {
     const ipv6 = sortByPreferredColo(items.filter(item => item.ip.includes(':')), preferredColo);
     const ipv4 = sortByPreferredColo(items.filter(item => !item.ip.includes(':')), preferredColo);
-    if (!ipv6Enabled) return ipv4.slice(0, limit);
-    if (!ipv4Enabled) return ipv6.slice(0, limit);
+    const carriers = selectedCarrierKeys(ispMobile, ispUnicom, ispTelecom);
+    const pick = (list, count) => carriers.length > 1
+        ? selectBalancedCarrierIPs(list, count, carriers)
+        : list.slice(0, count);
+    if (!ipv6Enabled) return pick(ipv4, limit);
+    if (!ipv4Enabled) return pick(ipv6, limit);
     const ipv4Limit = Math.max(1, Math.round(limit * IPV4_RESERVE_RATIO));
-    const selectedIPv6 = ipv6.slice(0, Math.max(0, limit - ipv4Limit));
-    const selectedIPv4 = ipv4.slice(0, Math.min(ipv4Limit, limit - selectedIPv6.length));
+    const selectedIPv6 = pick(ipv6, Math.max(0, limit - ipv4Limit));
+    const selectedIPv4 = pick(ipv4, Math.min(ipv4Limit, limit - selectedIPv6.length));
     const selected = [...selectedIPv6, ...selectedIPv4];
     if (selected.length < limit) {
-        selected.push(...ipv4.slice(selectedIPv4.length, selectedIPv4.length + limit - selected.length));
+        const seen = new Set(selected.map(item => `${item.ip}|${item.port || 443}`));
+        for (const item of [...ipv6, ...ipv4]) {
+            if (selected.length >= limit) break;
+            const key = `${item.ip}|${item.port || 443}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            selected.push(item);
+        }
     }
     return selected.slice(0, limit);
 }
 
 function filterDynamicIPs(items, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom) {
+    const selected = new Set(selectedCarrierKeys(ispMobile, ispUnicom, ispTelecom));
+    if (selected.size === 0) return [];
     return items.filter(item => {
-        const isp = item.isp || '';
-        if (isp.includes('移动') && !ispMobile) return false;
-        if (isp.includes('联通') && !ispUnicom) return false;
-        if (isp.includes('电信') && !ispTelecom) return false;
-        if (isp.includes('三网') && !ispMobile && !ispUnicom && !ispTelecom) return false;
+        const carriers = itemCarrierKeys(item);
+        if (carriers.length > 0 && !carriers.some(carrier => selected.has(carrier))) return false;
         const isIPv6 = item.ip.includes(':');
         return isIPv6 ? ipv6Enabled : ipv4Enabled;
     });
+}
+
+function selectedCarrierKeys(ispMobile, ispUnicom, ispTelecom) {
+    return [ispMobile && 'mobile', ispUnicom && 'unicom', ispTelecom && 'telecom'].filter(Boolean);
+}
+
+function itemCarrierKeys(item) {
+    const isp = item?.isp || '';
+    if (isp.includes('三网')) return ['mobile', 'unicom', 'telecom'];
+    return [isp.includes('移动') && 'mobile', isp.includes('联通') && 'unicom', isp.includes('电信') && 'telecom'].filter(Boolean);
 }
 
 function dedupeIPItems(items) {
@@ -183,16 +314,16 @@ function dedupeIPItems(items) {
 }
 
 // 三网轮询取样，避免某个上游或运营商占满整个订阅。
-function selectBalancedCarrierIPs(items, limit) {
+function selectBalancedCarrierIPs(items, limit, carrierKeys = ['mobile', 'unicom', 'telecom']) {
     const pools = {
-        mobile: items.filter(item => (item.isp || '').includes('移动')),
-        unicom: items.filter(item => (item.isp || '').includes('联通')),
-        telecom: items.filter(item => (item.isp || '').includes('电信')),
-        generic: items.filter(item => !/(移动|联通|电信)/.test(item.isp || ''))
+        mobile: items.filter(item => itemCarrierKeys(item).includes('mobile')),
+        unicom: items.filter(item => itemCarrierKeys(item).includes('unicom')),
+        telecom: items.filter(item => itemCarrierKeys(item).includes('telecom')),
+        generic: items.filter(item => itemCarrierKeys(item).length === 0)
     };
     const selected = [];
     const seen = new Set();
-    const orderedPools = [pools.mobile, pools.unicom, pools.telecom];
+    const orderedPools = carrierKeys.map(key => pools[key] || []);
     while (selected.length < limit && orderedPools.some(pool => pool.length > 0)) {
         for (const pool of orderedPools) {
             const item = pool.shift();
@@ -265,51 +396,20 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
             const timeoutId = setTimeout(() => controller.abort(), 超时时间);
             const response = await fetch(url, { signal: controller.signal });
             clearTimeout(timeoutId);
+            if (!response.ok) return;
+            const buffer = await response.arrayBuffer();
+            const contentType = (response.headers.get('content-type') || '').toLowerCase();
+            const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
+            const decoders = charset.includes('gb') ? ['gb2312', 'utf-8'] : ['utf-8', 'gb2312'];
             let text = '';
-            try {
-                const buffer = await response.arrayBuffer();
-                const contentType = (response.headers.get('content-type') || '').toLowerCase();
-                const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
-
-                // 根据 Content-Type 响应头判断编码优先级
-                let decoders = ['utf-8', 'gb2312']; // 默认优先 UTF-8
-                if (charset.includes('gb') || charset.includes('gbk') || charset.includes('gb2312')) {
-                    decoders = ['gb2312', 'utf-8']; // 如果明确指定 GB 系编码，优先尝试 GB2312
-                }
-
-                // 尝试多种编码解码
-                let decodeSuccess = false;
-                for (const decoder of decoders) {
-                    try {
-                        const decoded = new TextDecoder(decoder).decode(buffer);
-                        // 验证解码结果的有效性
-                        if (decoded && decoded.length > 0 && !decoded.includes('\ufffd')) {
-                            text = decoded;
-                            decodeSuccess = true;
-                            break;
-                        } else if (decoded && decoded.length > 0) {
-                            // 如果有替换字符 (U+FFFD)，说明编码不匹配，继续尝试下一个编码
-                            continue;
-                        }
-                    } catch (e) {
-                        // 该编码解码失败，尝试下一个
-                        continue;
-                    }
-                }
-
-                // 如果所有编码都失败或无效，尝试 response.text()
-                if (!decodeSuccess) {
-                    text = await response.text();
-                }
-
-                // 如果返回的是空或无效数据，返回
-                if (!text || text.trim().length === 0) {
-                    return;
-                }
-            } catch (e) {
-                console.error('Failed to decode response:', e);
-                return;
+            for (const decoder of decoders) {
+                try {
+                    const decoded = new TextDecoder(decoder).decode(buffer);
+                    if (decoded && !decoded.includes('\ufffd')) { text = decoded; break; }
+                } catch (_) { }
             }
+            if (!text) text = new TextDecoder().decode(buffer);
+            if (!text || text.trim().length === 0) return;
             const lines = text.trim().split('\n').map(l => l.trim()).filter(l => l);
             const isCSV = lines.length > 1 && lines[0].includes(',');
             const IPV6_PATTERN = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
@@ -353,7 +453,7 @@ async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) 
                     });
                 }
             }
-        } catch (e) { }
+        } catch (_) { }
     }));
     return Array.from(results);
 }
@@ -641,7 +741,7 @@ function encodeBase64Utf8(value) {
 }
 
 // 对所有协议做最终全局命名去重，避免不同来源或协议产生相同显示名称。
-function ensureUniqueNodeNames(links) {
+function ensureUniqueLinkNamesLegacy(links) {
     const counts = new Map();
     const uniqueName = name => {
         const count = (counts.get(name) || 0) + 1;
@@ -671,58 +771,172 @@ function ensureUniqueNodeNames(links) {
     });
 }
 
-// 生成订阅内容
-async function handleSubscriptionRequest(request, env, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig = null) {
+function normalizeNodeServer(server) {
+    return String(server || '').trim().replace(/^\[|\]$/g, '');
+}
+
+function nodePorts(item, disableNonTLS) {
+    const CF_HTTP_PORTS = new Set([80, 8080, 8880, 2052, 2082, 2086, 2095]);
+    const CF_HTTPS_PORTS = new Set([443, 2053, 2083, 2087, 2096, 8443]);
+    if (item.port) {
+        const port = Number(item.port);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return [];
+        if (CF_HTTP_PORTS.has(port)) return disableNonTLS ? [] : [{ port, tls: false }];
+        return [{ port, tls: CF_HTTPS_PORTS.has(port) || !CF_HTTP_PORTS.has(port) }];
+    }
+    return disableNonTLS ? [{ port: 443, tls: true }] : [{ port: 443, tls: true }, { port: 80, tls: false }];
+}
+
+function enabledProtocols(evEnabled, etEnabled, vmEnabled) {
+    const protocols = [];
+    if (evEnabled) protocols.push('vless');
+    if (etEnabled) protocols.push('trojan');
+    if (vmEnabled) protocols.push('vmess');
+    return protocols.length > 0 ? protocols : ['vless'];
+}
+
+function buildNodesFromSource(list, protocols, credential, nodeDomain, disableNonTLS = false, customPath = '/', echConfig = null) {
+    const nodes = [];
+    const path = customPath || '/';
+    for (const item of list) {
+        const server = normalizeNodeServer(item.ip || item.domain);
+        if (!server) continue;
+        let nameBase = item.isp ? item.isp.replace(/\s/g, '_') : (item.name || item.domain || server);
+        if (item.colo && item.colo.trim()) nameBase = `${nameBase}-${item.colo.trim()}`;
+        for (const { port, tls } of nodePorts(item, disableNonTLS)) {
+            for (const protocol of protocols) {
+                const protocolLabel = protocol === 'vless' ? '' : `-${protocol === 'trojan' ? 'Trojan' : 'VMess'}`;
+                nodes.push({
+                    protocol,
+                    server,
+                    port,
+                    credential,
+                    tls,
+                    sni: tls ? nodeDomain : '',
+                    host: nodeDomain,
+                    path,
+                    fp: tls ? 'chrome' : '',
+                    echConfig: tls ? echConfig : null,
+                    name: `${nameBase}-${port}${protocolLabel}-WS${tls ? '-TLS' : ''}`
+                });
+            }
+        }
+    }
+    return nodes;
+}
+
+function nodeSemanticKey(node) {
+    return [node.protocol, normalizeNodeServer(node.server).toLowerCase(), node.port, node.credential,
+        node.tls ? 1 : 0, String(node.host || '').toLowerCase(), node.path || '/'].join('|');
+}
+
+function dedupeNodes(nodes) {
+    const unique = new Map();
+    for (const node of nodes) {
+        const key = nodeSemanticKey(node);
+        if (!unique.has(key)) unique.set(key, node);
+    }
+    return Array.from(unique.values());
+}
+
+function ensureUniqueNodeNames(nodes) {
+    const counts = new Map();
+    return nodes.map(node => {
+        const base = String(node.name || `${node.protocol}-${node.server}`).trim() || '节点';
+        const count = (counts.get(base) || 0) + 1;
+        counts.set(base, count);
+        return { ...node, name: count === 1 ? base : `${base}-${String(count).padStart(2, '0')}` };
+    });
+}
+
+function safeAuthorityHost(server) {
+    const normalized = normalizeNodeServer(server);
+    return normalized.includes(':') ? `[${normalized}]` : normalized;
+}
+
+function nodeToURI(node) {
+    if (node.protocol === 'vmess') {
+        const config = {
+            v: '2', ps: node.name, add: normalizeNodeServer(node.server), port: String(node.port),
+            id: node.credential, aid: '0', scy: 'auto', net: 'ws', type: 'none',
+            host: node.host, path: node.path || '/', tls: node.tls ? 'tls' : 'none'
+        };
+        if (node.tls) {
+            config.sni = node.sni;
+            config.fp = node.fp || 'chrome';
+        }
+        return `vmess://${encodeBase64Utf8(JSON.stringify(config))}`;
+    }
+    const params = new URLSearchParams({
+        ...(node.protocol === 'vless' ? { encryption: 'none' } : {}),
+        security: node.tls ? 'tls' : 'none',
+        type: 'ws', host: node.host, path: node.path || '/'
+    });
+    if (node.tls) {
+        params.set('sni', node.sni);
+        params.set('fp', node.fp || 'chrome');
+        if (node.echConfig) {
+            params.set('alpn', 'h2,http/1.1');
+            params.set('ech', node.echConfig);
+        }
+    }
+    return `${node.protocol}://${encodeURIComponent(node.credential)}@${safeAuthorityHost(node.server)}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`;
+}
+
+function yamlString(value) {
+    return JSON.stringify(String(value ?? ''));
+}
+
+function parsePreferredAddressItems(addresses) {
+    const pattern = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+    return addresses.map(raw => {
+        const match = String(raw).trim().match(pattern);
+        if (!match) return null;
+        const port = Number(match[2] || 443);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+        const ip = normalizeNodeServer(match[1]);
+        return { ip, port, name: (match[3] || ip).trim() };
+    }).filter(Boolean);
+}
+
+// 生成订阅内容。所有请求开关显式传入，避免 Worker 并发请求互相污染。
+async function handleSubscriptionRequest(request, env, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig = null, epdEnabled = true, epiEnabled = true, egiEnabled = true) {
     const url = new URL(request.url);
-    const finalLinks = [];
+    const finalNodes = [];
     const workerDomain = url.hostname;  // workerDomain始终是请求的hostname
     const nodeDomain = customDomain || url.hostname;  // 用户输入的域名用于生成节点时的host/sni
     const target = url.searchParams.get('target') || 'base64';
     const wsPath = customPath || '/';
+    const protocols = enabledProtocols(evEnabled, etEnabled, vmEnabled);
 
-    async function addNodesFromList(list) {
-        // 确保至少有一个协议被启用
-        const hasProtocol = evEnabled || etEnabled || vmEnabled;
-        const useVL = hasProtocol ? evEnabled : true;  // 如果没有选择任何协议，默认使用VLESS
-        
-        if (useVL) {
-            finalLinks.push(...generateLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
-        }
-        if (etEnabled) {
-            finalLinks.push(...await generateTrojanLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
-        }
-        if (vmEnabled) {
-            finalLinks.push(...generateVMessLinksFromSource(list, user, nodeDomain, disableNonTLS, wsPath, echConfig));
-        }
+    function addNodesFromList(list) {
+        finalNodes.push(...buildNodesFromSource(list, protocols, user, nodeDomain, disableNonTLS, wsPath, echConfig));
     }
 
     // 原生地址
     const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-    await addNodesFromList(nativeList);
+    addNodesFromList(nativeList);
 
     // 优选域名
-    if (epd) {
+    if (epdEnabled) {
         const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
-        await addNodesFromList(domainList);
+        addNodesFromList(domainList);
     }
 
     // 优选IP
-    if (epi) {
+    if (epiEnabled) {
         try {
             // 按当前订阅真正剩余的节点名额取样，确保启用优选域名后
             // IPv4/IPv6 的 10%/90% 比例不会被最终 50 节点截断破坏。
-            const remainingNodes = Math.max(0, MAX_SUBSCRIPTION_NODES - new Set(finalLinks).size);
-            const enabledProtocolCount = Math.max(1, [evEnabled, etEnabled, vmEnabled].filter(Boolean).length);
+            const remainingNodes = Math.max(0, MAX_SUBSCRIPTION_NODES - dedupeNodes(finalNodes).length);
             const portsPerItem = disableNonTLS ? 1 : 2;
-            const maxDynamicItems = Math.min(
-                MAX_DYNAMIC_IPS,
-                Math.floor(remainingNodes / (enabledProtocolCount * portsPerItem))
-            );
+            const maxDynamicItems = Math.min(MAX_DYNAMIC_IPS,
+                Math.floor(remainingNodes / Math.max(1, protocols.length * portsPerItem)));
             const dynamicIPList = await fetchDynamicIPs(
                 env, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, maxDynamicItems
             );
             if (dynamicIPList.length > 0) {
-                await addNodesFromList(dynamicIPList);
+                addNodesFromList(dynamicIPList);
             }
         } catch (error) {
             console.error('获取动态IP失败:', error);
@@ -730,117 +944,45 @@ async function handleSubscriptionRequest(request, env, user, customDomain, piu, 
     }
 
     // GitHub优选 / 优选API
-    if (egi) {
+    if (egiEnabled) {
         try {
-            // 检查是否是优选API URL（以https://开头）
+            let preferredItems = [];
             if (piu && piu.toLowerCase().startsWith('https://')) {
-                // 从优选API获取IP列表
-                const 优选API的IP = await 请求优选API([piu]);
-                if (优选API的IP && 优选API的IP.length > 0) {
-                    // 解析IP字符串格式：IP:端口#备注
-                    const IP列表 = 优选API的IP.map(原始地址 => {
-                        // 统一正则: 匹配 域名/IPv4/IPv6地址 + 可选端口 + 可选备注
-                        const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
-                        const match = 原始地址.match(regex);
-
-                        if (match) {
-                            const 节点地址 = match[1].replace(/[\[\]]/g, ''); // 移除IPv6的方括号
-                            const 节点端口 = match[2] || 443;
-                            const 节点备注 = match[3] || 节点地址;
-                            return {
-                                ip: 节点地址,
-                                port: parseInt(节点端口),
-                                name: 节点备注
-                            };
-                        }
-                        return null;
-                    }).filter(item => item !== null);
-                    
-                    if (IP列表.length > 0) {
-                        const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                        const useVL = hasProtocol ? evEnabled : true;
-                        
-                        if (useVL) {
-                            finalLinks.push(...generateLinksFromNewIPs(IP列表, user, nodeDomain, wsPath, echConfig));
-                        }
-                    }
-                }
+                preferredItems = parsePreferredAddressItems(await 请求优选API([piu]));
             } else if (piu && piu.includes('\n')) {
-                // 支持多行文本，包含混合格式（优选API URL + IP列表）
                 const 完整优选列表 = await 整理成数组(piu);
-                const 优选API = [], 优选IP = [], 其他节点 = [];
-                
+                const 优选API = [], 优选IP = [];
                 for (const 元素 of 完整优选列表) {
                     if (元素.toLowerCase().startsWith('https://')) {
                         优选API.push(元素);
-                    } else if (元素.toLowerCase().includes('://')) {
-                        其他节点.push(元素);
-                    } else {
+                    } else if (!元素.toLowerCase().includes('://')) {
                         优选IP.push(元素);
                     }
                 }
-                
-                // 从优选API获取IP
                 if (优选API.length > 0) {
-                    const 优选API的IP = await 请求优选API(优选API);
-                    优选IP.push(...优选API的IP);
+                    优选IP.push(...await 请求优选API(优选API));
                 }
-                
-                // 解析所有IP并生成节点
-                if (优选IP.length > 0) {
-                    const IP列表 = 优选IP.map(原始地址 => {
-                        const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
-                        const match = 原始地址.match(regex);
-
-                        if (match) {
-                            const 节点地址 = match[1].replace(/[\[\]]/g, '');
-                            const 节点端口 = match[2] || 443;
-                            const 节点备注 = match[3] || 节点地址;
-                            return {
-                                ip: 节点地址,
-                                port: parseInt(节点端口),
-                                name: 节点备注
-                            };
-                        }
-                        return null;
-                    }).filter(item => item !== null);
-                    
-                    if (IP列表.length > 0) {
-                        const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                        const useVL = hasProtocol ? evEnabled : true;
-                        
-                        if (useVL) {
-                            finalLinks.push(...generateLinksFromNewIPs(IP列表, user, nodeDomain, wsPath, echConfig));
-                        }
-                    }
-                }
+                preferredItems = parsePreferredAddressItems(优选IP);
             } else {
-                // 原有的GitHub优选逻辑（单URL）
-                const newIPList = await fetchAndParseNewIPs(piu);
-                if (newIPList.length > 0) {
-                    const hasProtocol = evEnabled || etEnabled || vmEnabled;
-                    const useVL = hasProtocol ? evEnabled : true;
-                    
-                    if (useVL) {
-                        finalLinks.push(...generateLinksFromNewIPs(newIPList, user, nodeDomain, wsPath, echConfig));
-                    }
-                }
+                preferredItems = await fetchAndParseNewIPs(piu);
             }
+            if (preferredItems.length > 0) addNodesFromList(preferredItems);
         } catch (error) {
             console.error('获取优选IP失败:', error);
         }
     }
 
-    if (finalLinks.length === 0) {
-        const errorRemark = "所有节点获取失败";
-        const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent(errorRemark)}`;
-        finalLinks.push(errorLink);
+    if (finalNodes.length === 0) {
+        finalNodes.push({
+            protocol: 'vless', server: '127.0.0.1', port: 80,
+            credential: '00000000-0000-0000-0000-000000000000', tls: false,
+            sni: '', host: 'error.com', path: '/', name: '所有节点获取失败'
+        });
     }
 
-    // 所有来源和协议统一去重并限制最终订阅节点数。
-    const limitedLinks = ensureUniqueNodeNames(
-        Array.from(new Set(finalLinks)).slice(0, MAX_SUBSCRIPTION_NODES)
-    );
+    // 标准节点对象先语义去重、限额、名称去重，再序列化为不同客户端格式。
+    const limitedNodes = ensureUniqueNodeNames(dedupeNodes(finalNodes).slice(0, MAX_SUBSCRIPTION_NODES));
+    const limitedLinks = limitedNodes.map(nodeToURI);
 
     let subscriptionContent;
     let contentType = 'text/plain; charset=utf-8';
@@ -848,33 +990,33 @@ async function handleSubscriptionRequest(request, env, user, customDomain, piu, 
     switch (target.toLowerCase()) {
         case 'clash':
         case 'clashr':
-            subscriptionContent = generateClashConfig(limitedLinks);
+            subscriptionContent = generateClashConfig(limitedNodes);
             contentType = 'text/yaml; charset=utf-8';
             break;
         case 'surge':
         case 'surge2':
         case 'surge3':
         case 'surge4':
-            subscriptionContent = generateSurgeConfig(limitedLinks);
+            subscriptionContent = generateSurgeConfig(limitedNodes);
             break;
         case 'quantumult':
         case 'quanx':
-            subscriptionContent = generateQuantumultConfig(limitedLinks);
+            subscriptionContent = generateQuantumultConfig(limitedNodes);
             break;
         default:
-            subscriptionContent = btoa(limitedLinks.join('\n'));
+            subscriptionContent = encodeBase64Utf8(limitedLinks.join('\n'));
     }
     
     return new Response(subscriptionContent, {
-        headers: { 
+        headers: {
             'Content-Type': contentType,
-            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
         },
     });
 }
 
 // 生成Clash配置（简化版，返回YAML格式）
-function generateClashConfig(links) {
+function generateClashConfig(nodes) {
     let yaml = 'port: 7890\n';
     yaml += 'socks-port: 7891\n';
     yaml += 'allow-lan: false\n';
@@ -882,45 +1024,42 @@ function generateClashConfig(links) {
     yaml += 'log-level: info\n\n';
     yaml += 'proxies:\n';
     
-    const proxyNames = [];
-    links.forEach((link, index) => {
-        const name = decodeURIComponent(link.split('#')[1] || `节点${index + 1}`);
-        proxyNames.push(name);
-        const server = link.match(/@([^:]+):(\d+)/)?.[1] || '';
-        const port = link.match(/@[^:]+:(\d+)/)?.[1] || '443';
-        const uuid = link.match(/vless:\/\/([^@]+)@/)?.[1] || '';
-        const tls = link.includes('security=tls');
-        const path = link.match(/path=([^&#]+)/)?.[1] || '/';
-        const host = link.match(/host=([^&#]+)/)?.[1] || '';
-        const sni = link.match(/sni=([^&#]+)/)?.[1] || '';
-        const echParam = link.match(/[?&]ech=([^&#]+)/)?.[1];
-        const echDomain = echParam ? decodeURIComponent(echParam).split('+')[0] : '';
-        
-        yaml += `  - name: ${name}\n`;
-        yaml += `    type: vless\n`;
-        yaml += `    server: ${server}\n`;
-        yaml += `    port: ${port}\n`;
-        yaml += `    uuid: ${uuid}\n`;
-        yaml += `    tls: ${tls}\n`;
+    const proxyNames = nodes.map(node => node.name);
+    nodes.forEach(node => {
+        yaml += `  - name: ${yamlString(node.name)}\n`;
+        yaml += `    type: ${node.protocol}\n`;
+        yaml += `    server: ${yamlString(normalizeNodeServer(node.server))}\n`;
+        yaml += `    port: ${node.port}\n`;
+        if (node.protocol === 'trojan') {
+            yaml += `    password: ${yamlString(node.credential)}\n`;
+        } else {
+            yaml += `    uuid: ${yamlString(node.credential)}\n`;
+        }
+        if (node.protocol === 'vmess') {
+            yaml += '    alterId: 0\n';
+            yaml += '    cipher: auto\n';
+        }
+        yaml += `    tls: ${Boolean(node.tls)}\n`;
         yaml += `    network: ws\n`;
         yaml += `    ws-opts:\n`;
-        yaml += `      path: ${path}\n`;
+        yaml += `      path: ${yamlString(node.path || '/')}\n`;
         yaml += `      headers:\n`;
-        yaml += `        Host: ${host}\n`;
-        if (sni) {
-            yaml += `    servername: ${sni}\n`;
+        yaml += `        Host: ${yamlString(node.host)}\n`;
+        if (node.sni) {
+            yaml += `    servername: ${yamlString(node.sni)}\n`;
         }
-        if (echDomain) {
+        if (node.echConfig) {
             yaml += `    ech-opts:\n`;
             yaml += `      enable: true\n`;
-            yaml += `      query-server-name: ${echDomain}\n`;
+            yaml += `      query-server-name: ${yamlString(node.echConfig.split('+')[0])}\n`;
         }
     });
     
     yaml += '\nproxy-groups:\n';
     yaml += '  - name: PROXY\n';
     yaml += '    type: select\n';
-    yaml += `    proxies: [${proxyNames.map(n => `'${n}'`).join(', ')}]\n`;
+    yaml += '    proxies:\n';
+    for (const name of proxyNames) yaml += `      - ${yamlString(name)}\n`;
     yaml += '\nrules:\n';
     yaml += '  - DOMAIN-SUFFIX,local,DIRECT\n';
     yaml += '  - IP-CIDR,127.0.0.0/8,DIRECT\n';
@@ -931,19 +1070,31 @@ function generateClashConfig(links) {
 }
 
 // 生成Surge配置
-function generateSurgeConfig(links) {
+function sanitizeSurgeValue(value) {
+    return String(value ?? '').replace(/[\r\n,=]/g, '_').trim();
+}
+
+function generateSurgeConfig(nodes) {
     let config = '[Proxy]\n';
-    links.forEach(link => {
-        const name = decodeURIComponent(link.split('#')[1] || '节点');
-        config += `${name} = vless, ${link.match(/@([^:]+):(\d+)/)?.[1] || ''}, ${link.match(/@[^:]+:(\d+)/)?.[1] || '443'}, username=${link.match(/vless:\/\/([^@]+)@/)?.[1] || ''}, tls=${link.includes('security=tls')}, ws=true, ws-path=${link.match(/path=([^&#]+)/)?.[1] || '/'}, ws-headers=Host:${link.match(/host=([^&#]+)/)?.[1] || ''}\n`;
+    nodes.forEach(node => {
+        const name = sanitizeSurgeValue(node.name);
+        const server = normalizeNodeServer(node.server);
+        const common = `tls=${Boolean(node.tls)}, ws=true, ws-path=${sanitizeSurgeValue(node.path || '/')}, ws-headers=Host:${sanitizeSurgeValue(node.host)}`;
+        if (node.protocol === 'trojan') {
+            config += `${name} = trojan, ${server}, ${node.port}, password=${sanitizeSurgeValue(node.credential)}, sni=${sanitizeSurgeValue(node.sni)}, ${common}\n`;
+        } else if (node.protocol === 'vmess') {
+            config += `${name} = vmess, ${server}, ${node.port}, username=${sanitizeSurgeValue(node.credential)}, ${common}\n`;
+        } else {
+            config += `${name} = vless, ${server}, ${node.port}, username=${sanitizeSurgeValue(node.credential)}, sni=${sanitizeSurgeValue(node.sni)}, ${common}\n`;
+        }
     });
-    config += '\n[Proxy Group]\nPROXY = select, ' + links.map((_, i) => decodeURIComponent(links[i].split('#')[1] || `节点${i + 1}`)).join(', ') + '\n';
+    config += '\n[Proxy Group]\nPROXY = select, ' + nodes.map(node => sanitizeSurgeValue(node.name)).join(', ') + '\n';
     return config;
 }
 
 // 生成Quantumult配置
-function generateQuantumultConfig(links) {
-    return btoa(links.join('\n'));
+function generateQuantumultConfig(nodes) {
+    return encodeBase64Utf8(nodes.map(nodeToURI).join('\n'));
 }
 
 // 生成iOS 26风格的主页
@@ -1318,6 +1469,17 @@ function generateHomePage(scuValue) {
         .footer a:active {
             opacity: 0.6;
         }
+
+        .status-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
+        .status-title { font-size: 19px; font-weight: 650; }
+        .status-badge { padding: 5px 10px; border-radius: 999px; background: rgba(142,142,147,.14); color: #86868b; font-size: 12px; font-weight: 600; }
+        .status-badge.ok { background: rgba(52,199,89,.14); color: #248a3d; }
+        .status-badge.error { background: rgba(255,59,48,.14); color: #d70015; }
+        .status-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+        .status-item { padding: 14px; border-radius: 14px; background: rgba(142,142,147,.10); }
+        .status-label { color: #86868b; font-size: 12px; margin-bottom: 5px; }
+        .status-value { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+        .status-error { display: none; margin-top: 12px; padding: 12px; border-radius: 12px; color: #d70015; background: rgba(255,59,48,.10); font-size: 13px; line-height: 1.45; }
         
         @media (prefers-color-scheme: dark) {
             body {
@@ -1390,6 +1552,10 @@ function generateHomePage(scuValue) {
             .footer a {
                 color: #5ac8fa !important;
             }
+
+            .status-item { background: rgba(142,142,147,.18); }
+            .status-badge.ok { color: #30d158; }
+            .status-badge.error, .status-error { color: #ff6961; }
             
         }
     </style>
@@ -1541,7 +1707,23 @@ function generateHomePage(scuValue) {
                 <input type="text" id="customECHDomain" placeholder="例如: cloudflare-ech.com" style="font-size: 14px;">
             </div>
         </div>
-        
+
+        <div class="card" id="systemStatusCard">
+            <div class="status-header">
+                <div class="status-title">采集状态</div>
+                <div class="status-badge" id="statusBadge">读取中</div>
+            </div>
+            <div class="status-grid">
+                <div class="status-item"><div class="status-label">Cron</div><div class="status-value" id="statusCron">检查中</div></div>
+                <div class="status-item"><div class="status-label">最近成功更新</div><div class="status-value" id="statusUpdated">--</div></div>
+                <div class="status-item"><div class="status-label">本次采集</div><div class="status-value" id="statusCurrent">IPv4 -- · IPv6 --</div></div>
+                <div class="status-item"><div class="status-label">历史地址池</div><div class="status-value" id="statusHistory">-- / 500</div></div>
+                <div class="status-item"><div class="status-label">历史 IP 版本</div><div class="status-value" id="statusVersions">IPv4 -- · IPv6 --</div></div>
+                <div class="status-item"><div class="status-label">HKG/NRT IPv6 保护</div><div class="status-value" id="statusProtected">--</div></div>
+            </div>
+            <div class="status-error" id="statusError"></div>
+        </div>
+
         <div class="footer">
             <p>简化版优选工具 • 仅用于节点生成</p>
             <div style="margin-top: 20px; display: flex; justify-content: center; gap: 24px; flex-wrap: wrap;">
@@ -1580,7 +1762,48 @@ function generateHomePage(scuValue) {
         
         // 订阅转换地址（从服务器注入）
         const SUB_CONVERTER_URL = "${ scu }";
-        
+
+        function formatStatusTime(value) {
+            if (!value) return '尚未成功采集';
+            const date = new Date(value);
+            return Number.isNaN(date.getTime()) ? '未知' : date.toLocaleString('zh-CN', { hour12: false });
+        }
+
+        async function loadSystemStatus() {
+            const badge = document.getElementById('statusBadge');
+            const errorBox = document.getElementById('statusError');
+            try {
+                const response = await fetch('/status', { cache: 'no-store' });
+                if (!response.ok) throw new Error('状态接口返回 ' + response.status);
+                const data = await response.json();
+                const collection = data.collection || {};
+                const history = data.history || {};
+                const kvReady = Boolean(data.configured && data.configured.kv);
+                const isError = collection.status === 'error';
+                const isWaiting = collection.status === 'waiting';
+                badge.textContent = !kvReady ? 'KV 未绑定' : isError ? '采集异常' : isWaiting ? '等待首次采集' : '运行正常';
+                badge.className = 'status-badge ' + ((!kvReady || isError) ? 'error' : (isWaiting ? '' : 'ok'));
+                document.getElementById('statusCron').textContent = kvReady ? '每 15 分钟（需已添加触发器）' : '无法使用';
+                document.getElementById('statusUpdated').textContent = formatStatusTime(collection.lastSuccessAt || collection.updatedAt);
+                document.getElementById('statusCurrent').textContent = 'IPv4 ' + (collection.currentIPv4 ?? '--') + ' · IPv6 ' + (collection.currentIPv6 ?? '--');
+                document.getElementById('statusHistory').textContent = (history.total ?? 0) + ' / ' + ((data.limits && data.limits.historyIPs) || 500);
+                document.getElementById('statusVersions').textContent = 'IPv4 ' + (history.ipv4 ?? 0) + ' · IPv6 ' + (history.ipv6 ?? 0);
+                document.getElementById('statusProtected').textContent = String(history.protectedHkgNrtIPv6 ?? 0);
+                const message = !kvReady ? '请把 KV 命名空间绑定为 WETEST_HISTORY，并添加每 15 分钟 Cron 触发器。' : (collection.error || '');
+                errorBox.textContent = message;
+                errorBox.style.display = message ? 'block' : 'none';
+            } catch (error) {
+                badge.textContent = '读取失败';
+                badge.className = 'status-badge error';
+                errorBox.textContent = error.message || '无法读取采集状态';
+                errorBox.style.display = 'block';
+            }
+        }
+
+        loadSystemStatus();
+        setInterval(loadSystemStatus, 60000);
+        document.addEventListener('visibilitychange', function () { if (!document.hidden) loadSystemStatus(); });
+
         function tryOpenApp(schemeUrl, fallbackCallback, timeout) {
             timeout = timeout || 2500;
             let appOpened = false;
@@ -1660,9 +1883,9 @@ function generateHomePage(scuValue) {
             }
             
             // 添加协议选择
-            if (switches.switchVL) subscriptionUrl += '&ev=yes';
-            if (switches.switchTJ) subscriptionUrl += '&et=yes';
-            if (switches.switchVM) subscriptionUrl += '&mess=yes';
+            subscriptionUrl += \`&ev=\${switches.switchVL ? 'yes' : 'no'}\`;
+            subscriptionUrl += \`&et=\${switches.switchTJ ? 'yes' : 'no'}\`;
+            subscriptionUrl += \`&mess=\${switches.switchVM ? 'yes' : 'no'}\`;
             
             if (!ipv4Enabled) subscriptionUrl += '&ipv4=no';
             if (!ipv6Enabled) subscriptionUrl += '&ipv6=no';
@@ -1773,11 +1996,18 @@ function generateHomePage(scuValue) {
 export default {
     async scheduled(controller, env, ctx) {
         // 配合 */15 * * * * Cron，在没有订阅请求时也持续累计 WeTest 历史。
-        ctx.waitUntil(fetchDynamicIPs(env, true, true, true, true, true));
+        ctx.waitUntil(refreshWetestHistory(env).catch(async error => {
+            console.error('Cron 更新 WeTest 历史失败:', error);
+            await recordWetestError(env, error);
+        }));
     },
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
         const path = url.pathname;
+
+        if (path === '/status') {
+            return handleStatusRequest(env);
+        }
         
         // 主页
         if (path === '/' || path === '') {
@@ -1798,7 +2028,6 @@ export default {
                     }
                 });
             }
-            
             const apiUrl = url.searchParams.get('url');
             const port = url.searchParams.get('port') || '443';
             const timeout = parseInt(url.searchParams.get('timeout') || '3000');
@@ -1854,15 +2083,18 @@ export default {
             }
             
             // 从URL参数获取配置
-            epd = url.searchParams.get('epd') !== 'no';
-            epi = url.searchParams.get('epi') !== 'no';
-            egi = url.searchParams.get('egi') !== 'no';
+            const epdEnabled = url.searchParams.get('epd') !== 'no';
+            const epiEnabled = url.searchParams.get('epi') !== 'no';
+            const egiEnabled = url.searchParams.get('egi') !== 'no';
             const piu = url.searchParams.get('piu') || defaultIPURL;
             
             // 协议选择
-            const evEnabled = url.searchParams.get('ev') === 'yes' || (url.searchParams.get('ev') === null && ev);
+            const evEnabled = url.searchParams.get('ev') === 'yes' || (url.searchParams.get('ev') === null && DEFAULT_EV);
             const etEnabled = url.searchParams.get('et') === 'yes';
             const vmEnabled = url.searchParams.get('mess') === 'yes';
+            if ((evEnabled || vmEnabled) && !isValidUUID(uuid)) {
+                return new Response('UUID 格式错误；VLESS/VMess 必须使用标准 UUID', { status: 400 });
+            }
             
             // IPv4/IPv6选择
             const ipv4Enabled = url.searchParams.get('ipv4') !== 'no';
@@ -1885,9 +2117,34 @@ export default {
             // 自定义路径
             const customPath = url.searchParams.get('path') || '/';
 
-            return await handleSubscriptionRequest(request, env, uuid, domain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig);
+            return await handleSubscriptionRequest(
+                request, env, uuid, domain, piu, ipv4Enabled, ipv6Enabled,
+                ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled,
+                disableNonTLS, customPath, echConfig, epdEnabled, epiEnabled, egiEnabled
+            );
         }
         
         return new Response('Not Found', { status: 404 });
     }
+};
+
+// 命名导出仅用于本地自动化测试，不影响 Cloudflare Worker 的默认入口。
+export {
+    buildNodesFromSource,
+    dedupeNodes,
+    ensureUniqueNodeNames,
+    filterDynamicIPs,
+    generateClashConfig,
+    generateHomePage,
+    generateQuantumultConfig,
+    generateSurgeConfig,
+    handleSubscriptionRequest,
+    handleStatusRequest,
+    itemCarrierKeys,
+    mergeWetestHistory,
+    nodeToURI,
+    parsePreferredAddressItems,
+    pruneWetestHistory,
+    selectBalancedCarrierIPs,
+    selectWetestIPs
 };
